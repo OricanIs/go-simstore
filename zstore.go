@@ -31,6 +31,9 @@ func (z *zstore) add(p uint64) {
 	z.u = append(z.u, p)
 }
 
+func (z *zstore) clean() {
+}
+
 func (z *zstore) finish() {
 	z.u.finish()
 	z.compress()

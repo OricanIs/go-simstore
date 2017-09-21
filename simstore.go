@@ -23,6 +23,14 @@ type entry struct {
 	docid uint64
 }
 
+func (e *entry) Hash() uint64 {
+	return e.hash
+}
+
+func (e *entry) DocID() uint64 {
+	return e.docid
+}
+
 type table []entry
 
 func (t table) Len() int           { return len(t) }
@@ -45,6 +53,16 @@ func (t table) find(sig uint64) []uint64 {
 	return ids
 }
 
+func (t table) search(sig uint64) table {
+	i := sort.Search(len(t), func(i int) bool { return t[i].hash >= sig })
+	var ts table
+	for i < len(t) && t[i].hash == sig {
+		ts = append(ts, t[i])
+		i++
+	}
+	return ts
+}
+
 func NewU64Slice(hashes int) u64store {
 	u := make(u64slice, 0, hashes)
 	return &u
@@ -54,6 +72,7 @@ type u64store interface {
 	add(hash uint64)
 	find(sig uint64, mask uint64, d int) []uint64
 	finish()
+	clean()
 }
 
 // a store for uint64s
@@ -84,6 +103,10 @@ func (u *u64slice) add(p uint64) {
 	*u = append(*u, p)
 }
 
+func (u u64slice) clean() {
+	u = append(u[:0], u[len(u):]...)
+}
+
 func (u u64slice) finish() {
 	sort.Sort(u)
 }
@@ -91,6 +114,7 @@ func (u u64slice) finish() {
 // Store is a storage engine for 64-bit hashes
 type Store struct {
 	docids  table
+	Count   int
 	rhashes []u64store
 }
 
@@ -113,6 +137,7 @@ func (s *Store) Add(sig uint64, docid uint64) {
 	var t int
 
 	s.docids = append(s.docids, entry{hash: sig, docid: docid})
+	s.Count++
 
 	for i := 0; i < 4; i++ {
 		p := sig
@@ -133,6 +158,10 @@ func (s *Store) Add(sig uint64, docid uint64) {
 
 		sig = (sig << 16) | (sig >> (64 - 16))
 	}
+}
+
+func (s *Store) Size() int {
+	return s.Count
 }
 
 func (*Store) unshuffle(sig uint64, t int) uint64 {
@@ -166,7 +195,7 @@ func (l limiter) leave() { <-l }
 func (s *Store) Finish() {
 
 	// empty store
-	if len(s.docids) == 0 {
+	if s.Count == 0 {
 		return
 	}
 
@@ -193,7 +222,7 @@ func (s *Store) Finish() {
 func (s *Store) Find(sig uint64) []uint64 {
 
 	// empty store
-	if len(s.docids) == 0 {
+	if s.Count == 0 {
 		return nil
 	}
 
@@ -231,6 +260,68 @@ func (s *Store) Find(sig uint64) []uint64 {
 	return docids
 }
 
+// Find searches the store for all hashes hamming distance 3 or less from the
+// query signature.  It returns the associated list of document ids.
+func (s *Store) Search(sig uint64) table {
+
+	// empty store
+	if s.Count == 0 {
+		return nil
+	}
+
+	var ids []uint64
+
+	// TODO(dgryski): search in parallel
+	var t int
+	for i := 0; i < 4; i++ {
+		p := sig
+		ids = append(ids, s.unshuffleList(s.rhashes[t].find(p, mask3, 3), t)...)
+		t++
+
+		p = (sig & 0xffff000000ffffff) | (sig & 0x0000fff000000000 >> 12) | (sig & 0x0000000fff000000 << 12)
+		ids = append(ids, s.unshuffleList(s.rhashes[t].find(p, mask3, 3), t)...)
+		t++
+
+		p = (sig & 0xffff000fff000fff) | (sig & 0x0000fff000000000 >> 24) | (sig & 0x0000000000fff000 << 24)
+		ids = append(ids, s.unshuffleList(s.rhashes[t].find(p, mask3, 3), t)...)
+		t++
+
+		p = (sig & 0xffff000ffffff000) | (sig & 0x0000fff000000000 >> 36) | (sig & 0x0000000000000fff << 36)
+		ids = append(ids, s.unshuffleList(s.rhashes[t].find(p, mask3, 3), t)...)
+		t++
+
+		sig = (sig << 16) | (sig >> (64 - 16))
+	}
+
+	ids = unique(ids)
+
+	var ts table
+	for _, v := range ids {
+		ts = append(ts, s.docids.search(v)...)
+	}
+
+	return ts
+}
+
+func (s *Store) Item() <-chan entry {
+	ch := make(chan entry)
+	go func() {
+		for _, v := range s.docids {
+			ch <- v
+		}
+		close(ch)
+	}()
+	return ch
+}
+
+func (s *Store) Clean() {
+	s.docids = append(s.docids[:0], s.docids[len(s.docids):]...)
+	for i := range s.rhashes {
+		s.rhashes[i].clean()
+	}
+	s.Count = len(s.docids)
+}
+
 // SmallStore3 is a simstore for distance k=3 with smaller memory requirements
 type SmallStore3 struct {
 	tables [4][1 << 16]table
@@ -241,7 +332,6 @@ func New3Small(hashes int) *SmallStore3 {
 }
 
 func (s *SmallStore3) Add(sig uint64, docid uint64) {
-
 	for i := 0; i < 4; i++ {
 		prefix := (sig & 0xffff000000000000) >> (64 - 16)
 		s.tables[i][prefix] = append(s.tables[i][prefix], entry{hash: sig, docid: docid})
